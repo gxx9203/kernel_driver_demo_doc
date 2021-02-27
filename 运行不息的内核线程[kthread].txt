@@ -1,0 +1,116 @@
+﻿运行不息的内核线程【kthread】
+
+
+要创建一个内核线程有许多种方法，这里要学的是最简单的一种。
+打开include/Linux/kthread.h，看到了它全部的API，一共三个函数。
+
+ 
+struct task_struct kthread_run(int (*threadfn)(void *data), void *data,constchar namefmt[],...); 
+int kthread_stop(struct task_struct *k); 
+int kthread_should_stop(void); 
+
+
+
+1. kthread_run()负责内核线程的创建，参数包括入口函数 threadfn，参数data，线程名称namefmt。可以看到线程的名字可以是类似sprintf方式组成的字符串。如果实际看到 kthread.h文件，就会发现kthread_run实际是一个宏定义，它由kthread_create()和wake_up_process() 两部分组成，这样的好处是用kthread_run()创建的线程可以直接运行，使用方便。
+
+
+2. kthread_stop()负责结束创建的线程，参数是创建时返回的task_struct指针。kthread设置标志should_stop，并等待线程主动结束，返回线程的返回值。线程可能在kthread_stop()调用前就结束。（经过实际验证，如果线程在kthread_stop()调用之前就结束，之后kthread_stop()再调用会发生可怕地事情—调用kthread_stop()的进程crash！！之所以如此，是由于 kthread实现上的弊端，之后会专门写文章讲）
+
+
+3. kthread_should_stop()返回should_stop标志。它用于创建的线程检查结束标志，并决定是否退出。线程完全可以在完成自己的工作后主动结束，不需等待should_stop标志。
+
+
+
+////////////////////////////////////
+尝试一下运行不息的内核线程：
+////////////////////////////////////
+#include <linux/init.h>  
+#include <linux/module.h>  
+#include <linux/kthread.h>  
+ 
+MODULE_LICENSE("Dual BSD/GPL"); 
+
+staticstruct task_struct *tsk; 
+ 
+staticint thread_function(void *data) 
+{ 
+    int time_count = 0; 
+    do { 
+        printk(KERN_INFO "thread_function: %d times", ++time_count); 
+        msleep(1000); 
+    }while(!kthread_should_stop() && time_count<=30); 
+    return time_count; 
+} 
+ 
+staticint hello_init(void) 
+{ 
+    printk(KERN_INFO "Hello, world!\n"); 
+ 
+    tsk = kthread_run(thread_function, NULL, "shi_thread%d", 1); 
+    if (IS_ERR(tsk)) { 
+        printk(KERN_INFO "create kthread failed!\n"); 
+    } 
+    else { 
+        printk(KERN_INFO "create ktrhead ok!\n"); 
+    } 
+    return 0; 
+} 
+ 
+staticvoid hello_exit(void) 
+{ 
+    printk(KERN_INFO "Hello, exit!\n"); 
+    if (!IS_ERR(tsk)){ 
+        int ret = kthread_stop(tsk); 
+        printk(KERN_INFO "thread function has run %ds\n", ret); 
+    } 
+} 
+ 
+module_init(hello_init);
+module_exit(hello_exit);
+
+
+
+为了不让创建的内核线程一直运行浪费CPU，代码中采用周期性延迟的方式，每次循环 用msleep(1000)延迟1s。
+为了防止线程一直运行下去，代码中使用了两个结束条件：一个是模块要求线程结束，一个是打印满一定次数。
+后者是为了 防止printk输出信息太多。最后在hello_exit中结束线程，并打印线程运行的时间。
+
+这里要注意的是kthread_run的返回值tsk。不能用tsk是否为NULL进行检查，而要用IS_ERR()宏定义检查，这是因为返回的是错误码，
+大致从0xfffff000~0xffffffff。
+
+3、编译运行该模块，使用ps -e命令，就可以看到有名字为 shi_thread1 的内核线程在运行。
+
+
+
+
+总结： 
+      在内核中，创建一大堆的线程，现在已经易如反掌。所以模块的拓展空间是无限的。
+
+      kthread的实现在kernel/kthread.c中，头文件是include/linux/kthread.h。
+      
+      内核中一直运行一个线程【kthreadd】，它运行kthread.c中的kthreadd函数。在kthreadd函数中，不断检查一个kthread_create_list 链表。该链表中的每个节点都是一个创建内核线程的请求，kthreadd()发现该链表不为空，就将其第一个节点退出链表，
+      并调用create_kthread()创建相应的线程。create_kthread()则进一步调用更深层的kernel_thread()创建线程，入口函数设在kthread()中。
+
+
+
+
+      外界调用kthread_run创建运行线程。kthread_run是个宏定义，首先调用kthread_create()创建线程，如果创建成功，再 调用wake_up_process()唤醒新创建的线程。kthread_create()根据参数向kthread_create_list中发送一个请求，并唤醒kthreadd，之后会调用wait_for_completion(&create.done)等待线程创建完成。
+      
+      新创建的线程开始运行后，入口在kthread()，kthread()调用complete(&create->done)唤醒阻塞的模块进程，并使用schedule()调度出去。
+      kthread_create()被唤醒后，设置新线程的名称，并返回到kthread_run中。 kthread_run调用wake_up_process()重新唤醒新创建线程，此时新线程才开始运行kthread_run参数中的入口函数。
+
+
+
+
+      外界调用kthread_stop()删除线程。kthread_stop首先设置结束标志should_stop，然后调用 wake_for_completion(&kthread->exited)上，这个其实是新线程task_struct上的 vfork_done，会在线程结束调用do_exit()时设置。
+
+
+
+
+
+线程通常被定义为一个进程中代码的不同执行路线。从实现方式上划分，线程有两种类型：“用户级线程”和“内核级线程”。
+
+
+　　用户线程指不需要内核支持而在用户程序中实现的线程，其不依赖于操作系统核心，应用进程利用线程库提供创建、同步、调度和管理线程的函数来控制用户线程。这种线程甚至在象 DOS 这样的操作系统中也可实现，但线程的调度需要用户程序完成，这有些类似 Windows 3.x 的协作式多任务。
+　　
+　　
+　　内核线程指需要内核的参与，由内核完成线程的调度。其依赖于操作系统核心，由内核的内部需求进行创建和撤销，这两种模型各有其好处和缺点。用户线程不需要额外的内核开支，并且用户态线程的实现方式可以被定制或修改以适应特殊应用的要求，但是当一个线程因 I/O 而处于等待状态时，整个进程就会被调度程序切换为等待状态，其他线程得不到运行的机会；而内核线程则没有各个限制，有利于发挥多处理器的并发优势，但却占用了更多的系统开支。

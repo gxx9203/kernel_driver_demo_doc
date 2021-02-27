@@ -1,0 +1,316 @@
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+1. linux中的jiffies变量
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+   全局变量jiffies用来记录自系统启动以来产生的节拍的总数。启动时，内核将该变量初始化为0，此后，每次时钟中断处理程序都会增加该变量的值。
+   一秒内时钟中断的次数等于Hz，所以jiffies一秒内增加的值也就是Hz。
+
+   系统运行时间以秒为单位，等于jiffies/Hz。
+
+注意，jiffies类型为无符号长整型(unsigned long)，其他任何类型存放它都不正确。
+
+将以秒为单位的时间转化为jiffies：   seconds * Hz
+将jiffies转化为以秒为单位的时间：   jiffies / Hz
+
+相比之下，内核中将秒转换为jiffies用的多些。
+
+jiffies的内部表示
+   jiffies定义于文件<linux\Jiffies.h>中：
+
+/*
+* The 64-bit value is not atomic - you MUST NOT read it
+* without sampling the sequence number in xtime_lock.
+* get_jiffies_64() will do this for you as appropriate.
+*/
+extern u64 __jiffy_data jiffies_64;
+extern unsigned long volatile __jiffy_data jiffies;
+ld(1)脚本用于连接主内核映像（在x86上位于arch/i386/kernel/vmlinux.lds.S中），然后用jiffies_64变量的初值覆盖jiffies变量。
+因此jiffies取整个jiffies_64变量的低32位。
+
+访问jiffies的代码只会读取jiffies_64的低32位，通过get_jiffies_64()函数就可以读取整个64位的值。
+在64位体系结构上，jiffies_64和jiffies指的是同一个变量。
+
+#if (BITS_PER_LONG < 64)
+u64 get_jiffies_64(void);
+#else
+static inline u64 get_jiffies_64(void)
+{
+   return (u64)jiffies;
+}
+#endif
+
+在<Time.c(kernel)>中
+#if (BITS_PER_LONG < 64)
+u64 get_jiffies_64(void)
+{
+    unsigned long seq;
+    u64 ret;
+do {
+        seq = read_seqbegin(&xtime_lock);
+        ret = jiffies_64;
+    } while (read_seqretry(&xtime_lock, seq));
+return ret;
+}
+
+jiffies的回绕wrap around
+  当jiffies的值超过它的最大存放范围后就会发生溢出。对于32位无符号长整型，最大取值为(2^32)-1,即429496795。如果节拍计数达到了最大值后还要继续增加，
+  它的值就会回绕到0。
+
+
+内核提供了四个宏来帮助比较节拍计数，它们能正确的处理节拍计数回绕的问题：
+/*
+*  These inlines deal with timer wrapping correctly. You are
+*  strongly encouraged to use them
+*  1. Because people otherwise forget
+*  2. Because if the timer wrap changes in future you won't have to
+*     alter your driver code.
+*
+* time_after(a,b) returns true if the time a is after time b.
+*
+* Do this with "<0" and ">=0" to only test the sign of the result. A
+* good compiler would generate better code (and a really good compiler
+* wouldn't care). Gcc is currently neither.
+*/
+#define time_after(a,b)     \
+    (typecheck(unsigned long, a) && \
+     typecheck(unsigned long, b) && \
+     ((long)(b) - (long)(a) < 0))
+#define time_before(a,b)    time_after(b,a)
+#define time_after_eq(a,b)  \
+    (typecheck(unsigned long, a) && \
+     typecheck(unsigned long, b) && \
+     ((long)(a) - (long)(b) >= 0))
+#define time_before_eq(a,b) time_after_eq(b,a)
+/* Same as above, but does so with platform independent 64bit types.
+* These must be used when utilizing jiffies_64 (i.e. return value of
+* get_jiffies_64() */
+#define time_after64(a,b)   \
+    (typecheck(__u64, a) && \
+     typecheck(__u64, b) && \
+     ((__s64)(b) - (__s64)(a) < 0))
+#define time_before64(a,b)  time_after64(b,a)
+#define time_after_eq64(a,b)    \
+    (typecheck(__u64, a) && \
+     typecheck(__u64, b) && \
+     ((__s64)(a) - (__s64)(b) >= 0))
+#define time_before_eq64(a,b)   time_after_eq64(b,a)
+
+
+-------------------------------------------------------------------------------------------------
+问： 为什么可以应对jiffies的回绕问题？
+-------------------------------------------------------------------------------------------------
+答：
+
+jiffies溢出与时间先后比较-time_after,time_before
+
+说明：
+计算机位数限制，能表示的数值范围也是有限的；比如129在8位的计算机中，表示为1000 0001，按有符号数读取的话就是-127，无符号读取就是129.
+所以在判断结果是否小于0的时候，应该看存储的二进制的最高位是否为1.
+比如127-（-3）=130，虽然看起来是个正数，但是在8位计算机中，以有符号数读取的话就是负数，因为130存储为1000 0010.
+
+Linux内核为了解决jiffies的回绕问题，提供了现成的宏，用于判断时间的先后。
+在这里，就以time_after为例，看看它为什么可以应对jiffies的回绕问题。
+
+#define time_after(a,b)     \
+    (typecheck(unsigned long, a) && \
+     typecheck(unsigned long, b) && \
+     ((long)(b) - (long)(a) < 0))
+ 
+这个宏定义很简单，可以忽略typecheck，其就是用于检查参数的类型是否正确。如这里就是用于判断a和b是否为unsigned long类型。
+
+最关键的就是((long)(b) - (long)(a) < 0)。
+
+在理想的情况下，时间是可以不停增长的，后来的时间值一定比前面的值大。所以b-a一定小于0。
+然而计算机的世界不是一个理想的世界，所有的值都有其位数限制的。
+在32位平台上，long的位数为32位。按照二进制补码的表示方式，从0到0x7fffffff的区间，值是逐渐递增的。
+
+从0x80000000到0xFFFFFFFF这个区间，值是逐渐缩小的。
+
+这就有4中情况：
+
+1. a和b都在0到0x7FFFFFFF之间：             a若在b之后发生，则a的值大于b。那么(long)b-(long)a<0。
+2. a和b都在0x80000000到0xFFFFFFFF之间：    a若在b之后发生，b为较大的负数，a为较小的负数，那么(long)b-(long)a<0。
+3. b在0到0x7FFFFFFF之间，而a在0x80000000到0xFFFFFFFF之间： a为负数。b-a，相当于b+(-a)。只要a与b之间的绝对差值小于或等于0x80000000，则b+(-a)仍然为负数。
+4. b在0x80000000到0xFFFFFFFF之间，而a在0到0x7FFFFFFF之间： b为负数，b-a等于b+(-a)。同样在a与b之间的绝对差值小于或等于0x80000000，则b+(-a)仍然为负数。
+
+总结这四种情况，在a与b的绝对值相差不到0x80000000时，这个宏是正确的。而在利用jiffies作为时间度量 和 比较单位时，时间差并不会太大!!!
+所以这个time_after可以有效的避免jiffies回绕问题。
+
+
+
+-------------------------------------------------------------------------------------------------
+用户空间和HZ 的问题的提出：
+-------------------------------------------------------------------------------------------------
+  在2.6以前的内核中，如果改变内核中的HZ值会给用户空间中某些程序造成异常结果。因为内核是以节拍数/秒的形式给用户空间导出这个值的，
+  应用程序便依赖这个特定的HZ值。如果在内核中改变了HZ的定义值，就打破了用户空间的常量关系---用户空间并不知道新的HZ值。
+
+  解决方法：
+  
+  内核更改所有导出的jiffies值。内核定义了USER_HZ来代表用户空间看到的HZ值。在x86体系结构上，由于HZ值原来一直是100，所以USER_HZ值就定义为100。
+  内核可以使用宏jiffies_to_clock_t()将一个有HZ表示的节拍计数转换为一个由USER_HZ表示的节拍计数。
+
+在<Time.c(kernel)>中
+/*
+* Convert jiffies/jiffies_64 to clock_t and back.
+*/
+clock_t jiffies_to_clock_t(long x)
+{
+#if (TICK_NSEC % (NSEC_PER_SEC / USER_HZ)) == 0
+return x / (HZ / USER_HZ);
+#else
+    u64 tmp = (u64)x * TICK_NSEC;
+    do_div(tmp, (NSEC_PER_SEC / USER_HZ));
+return (long)tmp;
+#endif
+}
+unsigned long clock_t_to_jiffies(unsigned long x)
+{
+#if (HZ % USER_HZ)==0
+if (x >= ~0UL / (HZ / USER_HZ))
+return ~0UL;
+return x * (HZ / USER_HZ);
+#else
+    u64 jif;
+/* Don't worry about loss of precision here .. */
+if (x >= ~0UL / HZ * USER_HZ)
+return ~0UL;
+/* .. but do try to contain it here */
+    jif = x * (u64) HZ;
+    do_div(jif, USER_HZ);
+return jif;
+#endif
+}
+u64 jiffies_64_to_clock_t(u64 x)
+{
+#if (TICK_NSEC % (NSEC_PER_SEC / USER_HZ)) == 0
+    do_div(x, HZ / USER_HZ);
+#else
+/*
+     * There are better ways that don't overflow early,
+     * but even this doesn't overflow in hundreds of years
+     * in 64 bits, so..
+     */
+    x *= TICK_NSEC;
+    do_div(x, (NSEC_PER_SEC / USER_HZ));
+#endif
+return x;
+}
+在<Div64.h(include\asm-i385)>中
+/*
+* do_div() is NOT a C function. It wants to return
+* two values (the quotient and the remainder), but
+* since that doesn't work very well in C, what it
+* does is:
+*
+* - modifies the 64-bit dividend _in_place_
+* - returns the 32-bit remainder
+*
+* This ends up being the most efficient "calling
+* convention" on x86.
+*/
+#define do_div(n,base) ({ \
+    unsigned long __upper, __low, __high, __mod, __base; \
+    __base = (base); \
+    asm("":"=a" (__low), "=d" (__high):"A" (n)); \
+    __upper = __high; \
+if (__high) { \
+        __upper = __high % (__base); \
+        __high = __high / (__base); \
+    } \
+    asm("divl %2":"=a" (__low), "=d" (__mod):"rm" (__base), "0" (__low), "1" (__upper)); \
+    asm("":"=A" (n):"a" (__low),"d" (__high)); \
+    __mod; \
+})
+  用户空间期望HZ=USER_HZ，但是如果它们不相等，则由宏完成转换。
+  
+  
+  
+  
+  
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+2. jiffies
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+    如果需要特别精确的时间，就需要使用平台相关的资源，现代cpu基本上都包含一个随时钟周期而不断增长的计数寄存器，这个时钟计数寄存器是完成高分辨率计时任务的唯一可靠途径。
+
+　　基于不同的平台，这个寄存器可能是可读的，有可能是不可读的；可能32位，也可能64位；可能是可写的也可能不可写；如果是32位，那还得考虑溢出问题。在某一些平台上，该寄存器甚至根本不可能存在，或者如果如果cpu缺少这个特性，而我们又需要处理这种特殊的需求的时候，则可能会由硬件设计者通过外部设备实现。
+
+　　无论该寄存器是否可以置0，我们都强烈建议不要重置它，即使硬件允许这么做。毕竟我们不是该计数器唯一用户，例如在支持SMP的平台上，内核会依赖这种计数器来保持处理器之间的同步。因为总可以通过多次读取寄存器并比较读出数值的差异来完成要做的事，故无需要求独占该寄存器并修改它的当前值。
+
+　　最有名的计数寄存器就是TSC时间戳计数器，x86奔腾处理器开始提供该寄存器，并包括在以后的所有CPU中，包括x86_64在内，它是一个64位的寄存器，记录CPU时钟周期数，从内核空间和用户空间都可以读取它。
+
+　　包含头文件<asm/msr.h>(x86专用头文件意思是机器特有寄存器)只有就可以使用如下的宏：
+
+　　rdtsc(low32,high32);
+
+　　rdtscl(low32);
+
+　　rdtscll(var64);
+
+第一个宏原子性地把64位的数值读到两个32位变量中；后一个只把寄存器的地板部分读入一个32位变量中；最后一个将64位的的计数寄存器读入一个long long型的变量。
+
+下面这段代码仅仅使用了该寄存器的低半部分，可用来测量该指令自身的运行时间：
+
+　　unsigned long ini,end;
+
+　　rdtscl(ini);rdtscl(end);
+
+　　printk("time lapse:%li\n",end-ini);
+
+其他一些平台也提供了类似的功能，在内核头文件中还有一个与体系结构无关的函数可以代替rdtsc，即get_cycles，他定义在<asm/timex.h>(由<linux/timex.h>包含)，其原型如下：
+
+　　#include <linux/timex.h>
+
+　　cycles_t get_cycles(void);
+
+各种平台上都可以使用这个函数，在没有时钟周期计数寄存器的平台上它总是返回0。cycles_t 类型是能装入读取值的合适的无符号类型。
+
+除了这个与体系结构无关的函数外，我们还将举例说明一段内嵌的汇编代码。为此，我们将针对MIPS实现一个rdtscl函数，其功能和x86的一样。
+
+这个例子之所以基于IPS是因为大多数MIPS处理器都有一个32位的计数器，在它们内部的"coprocessor 0"中称它为寄存器9。为了从内核空间读取该寄存器，可以定义下面的宏，他执行"从coprocessor 0读取"的汇编指令。
+
+#define rdtscl(dest) __asm__ __volatile__ ("mfc0 %0,$9;nop":"=r" (dest))
+
+通过这个宏，MIPS处理器就可以执行前面用于x86的代码了。gcc内嵌汇编的有趣之处在于通用寄存器的分配使用是由编译器完成的。这个宏汇总使用的%0只是"参数0"的占位符，参数0由随后的"作为输出(=)使用的任意寄存器(r)"指定。该宏还声明了输出寄存器要对应于C的表达式dest。内联汇编的语法强大，但也十分复杂，特别是在对于各级存器使用的有限制的平台上更是如此，如x86系列。完整的语法描述在gcc文档中提供，一般在info文档树种就可以找到。
+
+本小节展示的短小的c代码段已经在一个K7系列的x86处理器和一个MIPS VR4181处理器(使用了刚才的宏)上运行过了。前者给出的事件消耗为11时钟周期，后者仅为2个时钟周期。这是可以理解的，因为RISC处理器通常在每时钟周期运行一条指令。
+
+关于时间戳计数器，还有值得一提的一点是：在SMp系统中，他们不会在多个处理器间保持同步。为了确保获得一致的值，我们需要为查询该计数器的代码禁止抢占。
+
+ 
+
+获取当前时间
+
+内核一般通过jiffies来获得当前时间。该数值表示的是子最近一次系统启动到当前的时间间隔，它和设备驱动程序无关，因为它的生命期只限于系统的运行期(uptime)。但驱动程序可以利用jiffies的当前值来计算不同事件间的时间间隔(比如在数设备驱动程序中就用它来分辨鼠标的单双击）。简而言之，利用jiffies值来测量时间间隔在大多数情况下已经够了，如果还需要测量更短的时间差，就只能利用处理器特定的寄存器了(但这会带来严重的兼容性问题)。
+
+驱动程序一般不需要知道墙钟时间(之日常生活使用的时间，用年月日来表达)，通常只有像cron和syslogd这样的用户程序才需要墙钟时间。对真实世界的时间处理通常最好留给用户空间，C函数库为我们提供了更好的支持。另外，这些代码通常具有更高的策略相关性，从而不能归于内核。但是内核也提供了将墙钟时间转换为jiffies值的函数：
+
+#include <linux/time.h>
+
+unsigned long mktime(unsigned int year,unsigned int mon,unsigned int day,unsigned int hour,unsigned int min,unsigned int sec);
+
+直接处理墙钟时间意味着实现某种策略，因此我们应该仔细审视一下。
+
+虽然内核空间中我们不必处理时间的人类可读取表达，但有时也需要处理绝对时间戳。为此，<linux/time.h>导出了do_gettimeofday函数。该函数用秒或者微妙值来填充一个指向struct timeval的指针变量--gettimeofday系统调用中用的也是同一变量。do_gettimeofday的原型如下：
+
+#include<linux/time.h>
+
+void do_gettimeofday(struct timeval *tv)；
+
+此内核源码表明do_gettimeofday在许多体系结构上有"接近微妙级的分辨率"，因为它通过查询定时硬件而得出了已经流逝在当前jiffies上的时间。但是实际精度是随平台的不同而变化的，因为它依赖于实际使用的硬件机智。例如，某些处理器无法提供高于jiffies的分辨率。另一方面，奔腾系列可以通过读取本章前面描述的时间戳计数器来获得非常快而精确的子滴答度量值。
+
+当前时间也可以通过xtime变量(struct timespec类型)获得，单精度要差一些。但是我们并不鼓励直接使用该函数，因为很难原子的访问timeval变量的两个成员。因此内核提供一个副主函数current_kernek_time:
+
+#include <linux/time.h>
+
+struct timespec current_kernel_time(void);
+
+获取当前时间的代码可见于jit模块中。jit模块将创建/proc/currentime文件，读取该文件，将以ASSCII码的形式返回下面几项数据：
+
+以十六进制表达的jiffies以及jiffies_64的当前值
+
+由do_gettimeofday返回的当前时间
+
+由current_kernel_time返回的timespec结构值
+
+这是动态的/proc文件方式----为了输出这几个不多的文本信息，不值得创建一个完整的设备。
